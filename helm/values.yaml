@@ -1,0 +1,9 @@
+
+image:
+  repository: docker.io/danielinclouds/cd-with-argo-app
+  pullPolicy: IfNotPresent
+  tag: "placeholder"
+
+service:
+  type: ClusterIP
+  port: 8080
