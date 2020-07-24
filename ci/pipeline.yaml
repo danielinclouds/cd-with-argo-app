@@ -1,0 +1,352 @@
+resource_types:
+- name: concourse-git-semver-tag
+  type: docker-image
+  source:
+    repository: laurentverbruggen/concourse-git-semver-tag-resource
+
+
+resources:
+- name: cd-with-argo-app
+  type: git
+  icon: github
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-app.git
+    branch: master
+    private_key: ((private-repo-key))
+
+- name: cd-with-argo-env-dev
+  type: git
+  icon: github
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-env-dev.git
+    branch: master
+    private_key: ((private-repo-key))
+
+- name: cd-with-argo-env-pre
+  type: git
+  icon: github
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-env-pre.git
+    branch: master
+    private_key: ((private-repo-key))
+
+- name: cd-with-argo-env-prod
+  type: git
+  icon: github
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-env-prod.git
+    branch: master
+    private_key: ((private-repo-key))
+
+
+- name: app-image
+  type: docker-image
+  source:
+    email: ((docker-hub-email))
+    username: ((docker-hub-username))
+    password: ((docker-hub-password))
+    repository: ((docker-hub-username))/cd-with-argo-app
+
+- name: helm-image
+  type: registry-image
+  icon: docker
+  source:
+    repository: danielinclouds/helm
+    tag: 3.2.4
+
+
+- name: app-semver
+  type: concourse-git-semver-tag
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-app.git
+    branch: master
+    private_key: ((private-repo-key))
+
+- name: env-semver-dev
+  type: concourse-git-semver-tag
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-env-dev.git
+    branch: master
+    private_key: ((private-repo-key))
+
+- name: env-semver-pre
+  type: concourse-git-semver-tag
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-env-pre.git
+    branch: master
+    private_key: ((private-repo-key))
+
+- name: env-semver-prod
+  type: concourse-git-semver-tag
+  source:
+    uri: git@github.com:danielinclouds/cd-with-argo-env-prod.git
+    branch: master
+    private_key: ((private-repo-key))
+
+
+
+helm-task-config: &helm-task-config
+  platform: linux
+  inputs:
+    - name: cd-with-argo-app
+    - name: app-semver
+  run:
+    path: /bin/sh
+    args:
+      - -c
+      - |
+        VERSION=$(cat app-semver/number)
+        echo "$VERSION"
+        
+        yq w -i cd-with-argo-app/helm/values.yaml image.tag "$VERSION"
+        yq w -i cd-with-argo-app/helm/Chart.yaml version "$VERSION"
+        yq w -i cd-with-argo-app/helm/Chart.yaml appVersion "$VERSION"
+
+        helm repo add chartmuseum http://chartmuseum-chartmuseum.infra.svc.cluster.local:8080
+
+        helm package cd-with-argo-app/helm/
+        helm push cd-with-argo-app-*.tgz chartmuseum
+
+
+umbrella-task-config: &umbrella-task-config
+  platform: linux
+  run:
+    path: /bin/sh
+    args:
+      - -c
+      - |
+        VERSION=$(cat app-semver/number)
+        echo "$VERSION"
+        
+        git clone "$REPO" "$REPO"-modified
+        cd "$REPO"-modified
+
+        yq w -i values.yaml cd-with-argo-app.image.tag     "$VERSION"
+        yq w -i Chart.yaml  version                  "$VERSION"
+        yq w -i Chart.yaml  appVersion               "$VERSION"
+        yq w -i Chart.yaml 'dependencies[0].version' "$VERSION"
+
+        git config --global user.name "Concourse"
+        git config --global user.email "concourse@concourse.local"
+        
+        git add .
+        git commit -m "Concourse: Promote $VERSION"
+
+
+health-status-prod-task-config: &health-status-task-config
+  platform: linux
+  run:
+    path: /bin/sh
+    args:
+      - -c
+      - |
+        # Waits 15s for the deployment to be ready
+        set +e
+        set -x
+
+        sleep 15
+
+        ARGO_URL="argocd-server.argocd.svc.cluster.local"
+        argocd login "$ARGO_URL" --username admin --password "$ARGOCD_PASS" --insecure
+
+        # Check if the app image is like semver and is healthy
+        semver=$(cat app-semver/number)
+
+        image=$(argocd app get "$ARGOCD_APP_NAME" -o yaml | yq r - 'status.summary.images')
+        imageversion="${image##*:}"
+        health_status=$(argocd app get "$ARGOCD_APP_NAME" -o yaml | yq r - 'status.health.status')
+
+        if [[ "$imageversion" == "$semver" ]]; then
+            echo "Image: Same as semver $imageversion"
+            if [[ "$health_status" == "Healthy" ]]; then
+                echo "Status: $health_status"
+                exit 0
+            else 
+                echo "Diff: got $health_status, want Healthy"
+            fi
+        else 
+            echo "Diff: got $imageversion, want $semver"
+        fi
+
+        exit 1
+
+
+
+jobs:
+- name: publish
+  public: true
+  serial: true
+  plan:
+  - get: cd-with-argo-app
+    trigger: true
+  - get: app-semver
+    params: {bump: minor}
+  - get: helm-image
+    trigger: false
+  - put: app-image
+    params:
+      build: cd-with-argo-app
+      tag_file: app-semver/number
+      build_args:
+        PORT: "8080"
+        APP_VERSION: "1.0.1" # TODO: This should not be hardcoded 
+  - task: push-helm-chart
+    image: helm-image
+    config:
+      << : *helm-task-config
+  - put: app-semver
+    params: {file: app-semver/number}
+
+
+- name: promote-to-dev
+  public: true
+  serial: true
+  plan:
+  - get: cd-with-argo-env-dev
+    trigger: false
+  - get: app-semver
+    passed: [publish]
+    trigger: true
+  - get: env-semver-dev
+    params: {bump: minor}
+  - get: helm-image
+    trigger: false
+  - task: update-umbrella-chart
+    image: helm-image
+    config:
+      inputs:
+        - name: cd-with-argo-env-dev
+        - name: app-semver
+      outputs:
+        - name: cd-with-argo-env-dev-modified
+      params:
+        REPO: cd-with-argo-env-dev
+      << : *umbrella-task-config
+  - put: cd-with-argo-env-dev
+    params: {repository: cd-with-argo-env-dev-modified}
+  - put: env-semver-dev
+    params: {file: env-semver-dev/number}
+
+
+- name: wait-for-dev
+  public: true
+  serial: true
+  plan:
+  - get: app-semver
+  - get: env-semver-dev
+    trigger: true
+    passed: [promote-to-dev]
+  - get: helm-image
+  - task: check-app-health-status
+    image: helm-image
+    config:
+      inputs:
+      - name: app-semver
+      - name: env-semver-dev
+      params:
+        ARGOCD_PASS: ((argocd_pass))
+        ARGOCD_APP_NAME: app-dev
+      << : *health-status-task-config
+
+
+- name: promote-to-pre
+  public: true
+  serial: true
+  plan:
+  - get: cd-with-argo-env-pre
+    trigger: false
+  - get: app-semver
+    passed: [wait-for-dev]
+    trigger: true
+  - get: env-semver-pre
+    params: {bump: minor}
+  - get: helm-image
+    trigger: false
+  - task: update-umbrella-chart-pre
+    image: helm-image
+    config:
+      inputs:
+        - name: cd-with-argo-env-pre
+        - name: app-semver
+      outputs:
+        - name: cd-with-argo-env-pre-modified
+      params:
+        REPO: cd-with-argo-env-pre
+      << : *umbrella-task-config
+  - put: cd-with-argo-env-pre
+    params: {repository: cd-with-argo-env-pre-modified}
+  - put: env-semver-pre
+    params: {file: env-semver-pre/number}
+
+
+- name: wait-for-pre
+  public: true
+  serial: true
+  plan:
+  - get: app-semver
+  - get: env-semver-pre
+    trigger: true
+    passed: [promote-to-pre]
+  - get: helm-image
+  - task: check-app-health-status-pre
+    image: helm-image
+    config:
+      inputs:
+      - name: app-semver
+      - name: env-semver-pre
+      params:
+        ARGOCD_PASS: ((argocd_pass))
+        ARGOCD_APP_NAME: app-pre
+      << : *health-status-task-config
+
+
+- name: promote-to-prod
+  public: true
+  serial: true
+  plan:
+  - get: cd-with-argo-env-prod
+    trigger: false
+  - get: app-semver
+    passed: [wait-for-pre]
+    trigger: false
+  - get: env-semver-prod
+    params: {bump: minor}
+  - get: helm-image
+    trigger: false
+  - task: update-umbrella-chart-prod
+    image: helm-image
+    config:
+      inputs:
+        - name: cd-with-argo-env-prod
+        - name: app-semver
+      outputs:
+        - name: cd-with-argo-env-prod-modified
+      params:
+        REPO: cd-with-argo-env-prod
+      << : *umbrella-task-config
+  - put: cd-with-argo-env-prod
+    params: {repository: cd-with-argo-env-prod-modified}
+  - put: env-semver-prod
+    params: {file: env-semver-prod/number}
+
+
+- name: wait-for-prod
+  public: true
+  serial: true
+  plan:
+  - get: app-semver
+  - get: env-semver-prod
+    trigger: true
+    passed: [promote-to-prod]
+  - get: helm-image
+  - task: check-app-health-status-prod
+    image: helm-image
+    config:
+      inputs:
+      - name: app-semver
+      - name: env-semver-prod
+      params:
+        ARGOCD_PASS: ((argocd_pass))
+        ARGOCD_APP_NAME: app-prod
+      << : *health-status-task-config
+
